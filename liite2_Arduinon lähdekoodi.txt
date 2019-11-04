@@ -1,0 +1,455 @@
+
+/*
+
+  iSPAM
+
+  Watson Device:
+
+  Organization ID
+  wk83dx
+
+  Device Type
+  MKR1000
+
+  Device ID
+  MailBox
+
+  Authentication Method
+  use-token-auth
+
+  Authentication Token
+  
+*/
+
+#define CS 0 // Assignment of the CS pin
+
+#include <SPI.h> // call library
+#include <SD.h>
+#include <AudioZero.h>
+#include <WiFi101.h>
+#include <MQTT.h>
+#include <MQTTClient.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+
+//WLAN
+char ssid[] = ""; // your network SSID (name)
+char pass[] = ""; // your network password (use for WPA)
+
+// IBM Watson
+// Your organization and device needs to be registered in IBM Watson IoT Platform.
+// Instruction for registering on page
+// https://internetofthings.ibmcloud.com/#
+//char *client_id = "d:<your Organization ID>:<your Device Type>:<your Device ID>";
+char *client_id = "d:wk83dx:MKR1000:MailBox";
+char *user_id = "use-token-auth"; // telling that authentication will be done with token
+char *authToken = ""; // Your IBM Watson Authentication Token
+//char *ibm_hostname = “your-org-id.messaging.internetofthings.ibmcloud.com?;
+char *ibm_hostname = "wk83dx.messaging.internetofthings.ibmcloud.com";
+
+
+WiFiClient net;
+MQTTClient MQTTc;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", 7200);
+
+const int chipSelect = 4;
+
+int i;
+int recu[2]; // Storage of module data
+int lumiere;
+
+unsigned long startMillis;
+unsigned long currentMillis;
+const unsigned long period = 1000; //period to read ambient light
+
+unsigned long startMillisLumiere;
+unsigned long currentMillisLumiere;
+const unsigned long periodLumiere = 5000; // period to check if open & send to watson
+bool auki = false;
+
+unsigned long startMillisLog;
+unsigned long currentMillisLog;
+const unsigned long periodLog = 5000; //period to write log file
+
+unsigned long startMillisEmail;
+unsigned long currentMillisEmail;
+const unsigned long periodEmail = 10000; //period to send email
+
+String emailContent;
+
+IPAddress ip = WiFi.localIP();    // ipaddress obtained from access point
+IPAddress gateway = WiFi.gatewayIP();
+IPAddress subnet = WiFi.subnetMask();
+
+char server[] = "mail.smtp2go.com";
+int port = 2525; // You can also try using Port Number 25, 8025 or 587.
+
+void setup()
+{
+  Serial.begin(9600); // initialization of serial communication
+  delay(2000); // Wait for wifi unit to power up
+  WiFi.begin(ssid, pass);
+  delay(5000); // Wait for WiFi to connect
+  SPI.begin(); // initialization of SPI port
+  SPI.setDataMode(SPI_MODE0); // configuration of SPI communication in mode 0
+  SPI.setClockDivider(SPI_CLOCK_DIV16); // configuration of clock at 1MHz
+  pinMode(CS, OUTPUT);
+
+  timeClient.begin();
+
+  while (!Serial);
+  Serial.println("Connected to WLAN");
+  printWiFiStatus();
+
+  Serial.println("Initializing SD card...");
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Card failed, or not present");
+    // don't do anything more:
+    while (true);
+  }
+  Serial.println("card initialized.");
+
+
+  startMillis = millis();
+  startMillisLumiere = millis();
+
+  MQTTc.begin(ibm_hostname, 1883, net); // Cut for testing without Watson
+  MQTTc.onMessage(messageReceived);
+  connect();
+
+}
+
+void loop()
+{
+
+  MQTTc.loop();  // Cut for testing without Watson
+
+  currentMillis = millis();
+  currentMillisLumiere = millis();
+  currentMillisLog = millis();
+  currentMillisEmail = millis();
+
+  String publishIP = DisplayAddress(WiFi.localIP());
+  String publishSSID = String(WiFi.SSID());
+  String publishRSSI = String(WiFi.RSSI());
+
+  //ambient lightin mittaus
+  if (currentMillis - startMillis >= period)
+  {
+    digitalWrite(CS, LOW); // activation of CS line
+    for (i = 0; i < 2; i = i + 1)
+    {
+      recu[i] = SPI.transfer(0); // Acquisition of the 2 bytes of data
+    }
+    digitalWrite(CS, HIGH); // deactivation of CS line
+    for (i = 0; i < 2; i = i + 1) // Send in serial monitor
+    {
+      Serial.print("i");
+      Serial.print(i);
+      Serial.print("=");
+      Serial.println(recu[i]);
+    }
+    lumiere = (recu[0] << 3) | (recu[1] >> 4); // Reconstitution of the 8-bit light variable
+    Serial.print("Lumiere=");
+    Serial.println(lumiere);
+    startMillis = currentMillis;
+  }
+
+  if (lumiere > 20 &&  lumiere < 1000 && currentMillisLumiere - startMillisLumiere >= periodLumiere)
+  {
+    auki = true;
+    playSound();
+    Serial.println("Publishing to Watson... (laatikko auki)");
+    if (!MQTTc.connected()) {   // Cut for testing without Watson
+      connect();                 // Cut for testing without Watson
+    }                           // Cut for testing without Watson
+    MQTTc.publish("iot-2/evt/SmartmailReport/fmt/json", "{\"open\":" + String(auki) + ",\"lumiere\":" + String(lumiere) + ",\"rssi\":" + publishRSSI + "}");
+    startMillisLumiere = currentMillisLumiere;
+    auki = false;
+  }
+
+  else if (lumiere < 1000 && auki == false && currentMillisLumiere - startMillisLumiere >= periodLumiere)
+  {
+
+    Serial.println("Publishing to Watson... (laatikko kiinni)");
+    if (!MQTTc.connected()) {   // Cut for testing without Watson
+      connect();                 // Cut for testing without Watson
+    }                           // Cut for testing without Watson
+    MQTTc.publish("iot-2/evt/SmartmailReport/fmt/json", "{\"open\":" + String(auki) + ",\"lumiere\":" + String(lumiere) + ",\"rssi\":" + publishRSSI + "}");
+    startMillisLumiere = currentMillisLumiere;
+  }
+
+  delay(200);
+
+  byte inChar;
+
+  inChar = Serial.read();
+
+  if (inChar == 'e')
+  {
+    if (sendEmail()) Serial.println(F("Email sent"));
+    else Serial.println(F("Email failed"));
+  }
+
+
+  //dataloggaus log.txt
+  if (lumiere < 1000 && currentMillisLog - startMillisLog >= periodLog && auki == true)
+  {
+    String logString = "";
+    timeClient.update();
+    String timeStamp = String(timeClient.getFormattedTime());
+    logString = timeStamp + " | Lumiere: " + String(lumiere) + " | IP: " + publishIP + " | SSID: " + publishSSID + " | RSSI: " + publishRSSI;
+    Serial.println("writing to log.txt: ");
+    Serial.println(logString);
+
+    File logFile = SD.open("log.txt", FILE_WRITE);
+
+    if (logFile) {
+      logFile.println(logString);
+      logFile.close();
+    }
+    else {
+      Serial.println("error opening log.txt");
+    }
+    startMillisLog = currentMillisLog;
+  }
+
+}
+
+void connect()
+{
+  Serial.print("checking WLAN...");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.print("\nconnecting Watson with MQTT....");
+  while (!MQTTc.connect(client_id, user_id, authToken))
+  {
+    Serial.print(".");
+    delay(3000);
+  }
+  Serial.println("\nconnected!"); // subscribe to nodered mqtt
+  MQTTc.onMessage(messageReceived);
+  MQTTc.subscribe("iot-2/cmd/+/fmt/json");
+  // client.unsubscribe("/hello");
+}
+
+void messageReceived(String &topic, String &payload) {
+  Serial.println("incoming: " + topic + " - " + payload);
+  if (topic.equals("iot-2/cmd/sendmail/fmt/json")) {
+    emailContent = "Hei! Postisi on luultavasti varastettu!";
+    if (sendEmail() && currentMillisEmail - startMillisEmail >= periodEmail) {
+      Serial.println(F("Email sent"));
+      startMillisEmail = currentMillisEmail;
+    }
+    
+    else Serial.println(F("Email failed"));
+    // Start rotating
+    // wait 5 seconds for connection:
+    delay(5000);
+  }
+  if (topic.equals("iot-2/cmd/sendwarning/fmt/json")) {
+    emailContent = "Hälytys! Postilaatikkosi on jäänyt auki!";
+    if (sendEmail() && currentMillisEmail - startMillisEmail >= periodEmail) {
+      Serial.println(F("Email sent"));
+      startMillisEmail = currentMillisEmail;
+    }
+    
+    else Serial.println(F("Email failed"));
+    // Start rotating
+    // wait 5 seconds for connection:
+    delay(5000);
+}
+}
+
+void printWiFiStatus() {
+  // print the SSID of the network you're attached to:
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  // print your WiFi shield's IP address:
+  IPAddress ip1 = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip1);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+}
+
+String DisplayAddress(IPAddress address)
+{
+  return String(address[0]) + "." +
+         String(address[1]) + "." +
+         String(address[2]) + "." +
+         String(address[3]);
+}
+
+void playSound() {
+
+  AudioZero.begin(2 * 44100);
+
+  File myFile = SD.open("test.wav");
+  if (!myFile) {
+    // if the file didn't open, print an error and stop
+    Serial.println("error opening test.wav");
+    while (true);
+  }
+  Serial.print("playing wav from SD");
+  AudioZero.play(myFile);
+  myFile.close();
+  AudioZero.end();
+  Serial.println(" ...played");
+}
+
+byte sendEmail()
+{
+  byte thisByte = 0;
+  byte respCode;
+
+  if (net.connect(server, port) == 1) {
+    Serial.println(F("connected"));
+  } else {
+    Serial.println(F("connection failed"));
+    return 0;
+  }
+
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending hello"));
+  // replace 1.2.3.4 with your Arduino's ip
+  net.println("EHLO 192.168.43.66");
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending auth login"));
+  net.println("auth login");
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending User"));
+  // Change to your base64 encoded user
+  net.println(F(""));
+
+
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending Password"));
+  // change to your base64 encoded password
+  net.println(F(""));
+
+
+  if (!eRcv()) return 0;
+
+  // change to your email address (sender)
+  Serial.println(F("Sending From"));
+  net.println("MAIL From: <smart@box.com>");
+  if (!eRcv()) return 0;
+
+  // change to recipient address
+  Serial.println(F("Sending To"));
+  net.println("RCPT To: <jonne.laitinen@student.hamk.fi>");
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending DATA"));
+  net.println("DATA");
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending email"));
+
+  // change to recipient address
+  net.println("To: Jonne <jonne.laitinen@student.hamk.fi>");
+
+  // change to your address
+  net.println("From: iSPAM <i@SPAM.com>");
+
+  net.println("Subject: iSPAM Notification");
+
+  net.println(emailContent);
+
+  net.println(".");
+
+  if (!eRcv()) return 0;
+
+  Serial.println(F("Sending QUIT"));
+  net.println("QUIT");
+  if (!eRcv()) return 0;
+  
+  //net.stop();
+
+  Serial.println(F("disconnected"));
+
+  return 1;
+}
+
+byte eRcv()
+{
+  byte respCode;
+  byte thisByte;
+  int loopCount = 0;
+
+  while (!net.available()) {
+    delay(1);
+    loopCount++;
+
+    // if nothing received for 10 seconds, timeout
+    if (loopCount > 10000) {
+    //  net.stop();
+      Serial.println(F("\r\nTimeout"));
+      return 0;
+    }
+  }
+
+  respCode = net.peek();
+
+  while (net.available())
+  {
+    thisByte = net.read();
+    Serial.write(thisByte);
+  }
+
+  if (respCode >= '4')
+  {
+    efail();
+    return 0;
+  }
+
+  return 1;
+}
+
+
+void efail()
+{
+  byte thisByte = 0;
+  int loopCount = 0;
+
+  net.println(F("QUIT"));
+
+  while (!net.available()) {
+    delay(1);
+    loopCount++;
+
+    // if nothing received for 10 seconds, timeout
+    if (loopCount > 10000) {
+      //net.stop();
+      Serial.println(F("\r\nTimeout"));
+      return;
+    }
+  }
+
+  while (net.available())
+  {
+    thisByte = net.read();
+    Serial.write(thisByte);
+  }
+
+  net.stop();
+
+  Serial.println(F("disconnected"));
+}
